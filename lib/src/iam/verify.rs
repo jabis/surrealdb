@@ -156,7 +156,6 @@ pub async fn basic_legacy(
 pub async fn token(kvs: &Datastore, session: &mut Session, token: &str) -> Result<(), Error> {
 	// Log the authentication type
 	trace!("Attempting token authentication");
-	// Decode the token without verifying
 	let token_data = decode::<Claims>(token, &KEY, &DUD)?;
 	// Convert the token to a SurrealQL object value
 	let value = token_data.claims.clone().into();
@@ -176,6 +175,74 @@ pub async fn token(kvs: &Datastore, session: &mut Session, token: &str) -> Resul
 	}
 	// Check the token authentication claims
 	match token_data.claims {
+		// Check if jti is present 
+		Claims {
+			ns: Some(ns),
+			db: Some(db),
+			sc: Some(sc),
+			tk: Some(tk),
+			jti: Some(jti),
+			username: Some(username),
+			id,
+			..
+		} => {
+			// Log the decoded authentication claims
+			trace!("Authenticating to scope `{}` with token `{}` and jti `{}`", sc, tk, jti);
+			// Create a new readonly transaction
+			let mut tx = kvs.transaction(Read, Optimistic).await?;
+			// Parse the record id
+			let id: Value = match id {
+				Some(id) => syn::thing(&id)?.into(),
+				None => Value::None,
+			};
+			// Get the scope token
+			let de = tx.get_sc_token(&ns, &db, &sc, &tk).await?;
+			let qry = format!("SELECT VALUE uuid FROM ONLY jti:{jti};");
+			let mut sess = session.clone();
+			sess.ns=Some(ns.to_owned());
+			sess.db=Some(db.to_owned());
+			sess.sc=Some(sc.to_owned());
+			sess.au=Arc::new(Auth::new(Actor::new(
+				de.name.to_string(), 
+				Default::default(),
+				Level::Scope(
+					ns.to_owned(),
+					db.to_owned(),
+					sc.to_owned()
+				)
+			)));
+			let jtie = kvs.execute(&qry, &sess, None).await?;
+			//debug!("jtie `{:#?}`",jtie);
+			let res = jtie.last();
+			let mut code = String::from(de.code);
+			if let Some(res) = res {
+				if res.result.as_ref().ok().is_some() {
+					let res:String = res.result.as_ref().unwrap().to_owned().as_string();
+					code = format!("{code}|{res}");
+					debug!("code `{:#?}` strand `{:#?}`", code, res);
+				} else {
+					debug!("no valid code found");
+				}
+			}
+			let cf = config(de.kind, code)?;
+			// Verify the token
+			decode::<Claims>(token, &cf.0, &cf.1)?;
+			// Log the success
+			debug!("Authenticated to scope `{}` with token `{}`", sc, tk);
+			// Set the session
+			session.sd = Some(id);
+			session.tk = Some(value);
+			//session.username = Some(username);
+			session.ns = Some(ns.to_owned());
+			session.db = Some(db.to_owned());
+			session.sc = Some(sc.to_owned());
+			session.au = Arc::new(Auth::new(Actor::new(
+				de.name.to_string(),
+				Default::default(),
+				Level::Scope(ns, db, sc),
+			)));
+			Ok(())
+		}
 		// Check if this is scope token authentication
 		Claims {
 			ns: Some(ns),
